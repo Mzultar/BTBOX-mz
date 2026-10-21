@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">X5 Lite BT Proxy</string>
+    <string name="service_channel_name">Gamepad Proxy Service</string>
+    <string name="notification_title">GameSir X5 Lite Proxy</string>
+    <string name="notification_text">Трансляция геймпада по Bluetooth активна</string>
+</resources>
