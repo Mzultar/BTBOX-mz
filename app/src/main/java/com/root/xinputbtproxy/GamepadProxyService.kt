@@ -6,7 +6,9 @@ import android.bluetooth.*
 import android.content.Context
 import android.content.Intent
 import android.os.Binder
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.Process
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -22,15 +24,17 @@ class GamepadProxyService : Service() {
 
     var onHostConnectionChanged: ((String?) -> Unit)? = null
 
-    // Экзекьютор для громкости
     private val volumeExecutor = Executors.newSingleThreadExecutor()
 
     private val targetState = ByteArray(9).apply { this[2] = 0x08 }
     private val lastAckedState = ByteArray(9).apply { this[2] = 0x08 }
 
-    private val stateLock = java.lang.Object()
+    private val stateLock = Object()
     @Volatile private var senderRunning = false
     private var senderThread: Thread? = null
+
+    // Хэндлер для задержек и ретраев подключения (по совету Клода)
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     inner class LocalBinder : Binder() {
         fun getService(): GamepadProxyService = this@GamepadProxyService
@@ -50,18 +54,19 @@ class GamepadProxyService : Service() {
 
     fun startProxy(useRoot: Boolean) {
         usedRootInSession = useRoot
-        if (useRoot) RootBtSpoofer.setGamepadMode(enable = true)
+        if (useRoot) RootBtSpoofer.setGamepadMode(true)
 
-        val btManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
+        val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         val adapter = btManager.adapter ?: return
 
         val prefs = getSharedPreferences("bt_proxy_prefs", Context.MODE_PRIVATE)
         val currentName = adapter.name
-        if ((!currentName.isNullOrEmpty()) && currentName != "Xbox Wireless Controller") {
-            prefs.edit().putString("original_bt_name", currentName).apply()
-        }
 
-        adapter.name = "Xbox Wireless Controller"
+        // Меняем имя только если оно отличается, чтобы лишний раз не дергать стек
+        if (!currentName.isNullOrEmpty() && currentName != "Xbox Wireless Controller") {
+            prefs.edit().putString("original_bt_name", currentName).apply()
+            adapter.name = "Xbox Wireless Controller"
+        }
 
         adapter.getProfileProxy(this, object : BluetoothProfile.ServiceListener {
             override fun onServiceConnected(profile: Int, proxy: BluetoothProfile?) {
@@ -84,6 +89,8 @@ class GamepadProxyService : Service() {
 
     fun stopProxyAndRestorePhone() {
         senderRunning = false
+        mainHandler.removeCallbacksAndMessages(null) // Очищаем незавершенные ретраи
+        volumeExecutor.shutdownNow()
         synchronized(stateLock) { stateLock.notifyAll() }
         senderThread?.interrupt()
         senderThread = null
@@ -96,7 +103,9 @@ class GamepadProxyService : Service() {
         val originalName = prefs.getString("original_bt_name", null)
 
         val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-        if (!originalName.isNullOrEmpty()) btManager.adapter?.name = originalName
+        if (!originalName.isNullOrEmpty() && btManager.adapter?.name != originalName) {
+            btManager.adapter?.name = originalName
+        }
 
         if (usedRootInSession) {
             RootBtSpoofer.setGamepadMode(false)
@@ -126,15 +135,20 @@ class GamepadProxyService : Service() {
             object : BluetoothHidDevice.Callback() {
                 override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
                     if (registered) {
-                        val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-                        btManager.adapter?.bondedDevices?.firstOrNull()?.let { pcDevice ->
-                            btHidDevice?.connect(pcDevice)
-                        }
+                        // ФИКС 3: Даем Windows 500 мс на осознание нового SDP-дескриптора
+                        mainHandler.postDelayed({ connectToTargetHost(attemptsLeft = 3) }, 500)
                     }
                 }
+
                 override fun onConnectionStateChanged(device: BluetoothDevice?, state: Int) {
                     if (state == BluetoothProfile.STATE_CONNECTED && device != null) {
                         connectedHost = device
+                        // ФИКС 1: Запоминаем MAC успешно подключенного ПК
+                        getSharedPreferences("bt_proxy_prefs", Context.MODE_PRIVATE)
+                            .edit()
+                            .putString("last_host_mac", device.address)
+                            .apply()
+
                         onHostConnectionChanged?.invoke("${device.name ?: "ПК"} (${device.address})")
                     } else if (state == BluetoothProfile.STATE_DISCONNECTED) {
                         if (connectedHost == device) {
@@ -145,6 +159,44 @@ class GamepadProxyService : Service() {
                 }
             }
         )
+    }
+
+    // ФИКС 1 + БОНУС: Умный поиск целевого устройства и ретраи
+    private fun connectToTargetHost(attemptsLeft: Int) {
+        val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        val adapter = btManager.adapter ?: return
+        val prefs = getSharedPreferences("bt_proxy_prefs", Context.MODE_PRIVATE)
+        val lastMac = prefs.getString("last_host_mac", null)
+
+        var targetDevice: BluetoothDevice? = null
+
+        // 1. Ищем последний успешный ПК по MAC
+        if (lastMac != null) {
+            targetDevice = adapter.bondedDevices?.firstOrNull { it.address == lastMac }
+        }
+        // 2. Если такого нет, ищем любое устройство с классом "Компьютер"
+        if (targetDevice == null) {
+            targetDevice = adapter.bondedDevices?.firstOrNull {
+                it.bluetoothClass?.majorDeviceClass == BluetoothClass.Device.Major.COMPUTER
+            }
+        }
+        // 3. Фолбэк на что угодно (если ПК определяется криво)
+        if (targetDevice == null) {
+            targetDevice = adapter.bondedDevices?.firstOrNull()
+        }
+
+        targetDevice?.let { device ->
+            btHidDevice?.connect(device)
+
+            // Если соединение не установилось, пробуем еще раз через 2 секунды
+            if (attemptsLeft > 1) {
+                mainHandler.postDelayed({
+                    if (connectedHost == null) {
+                        connectToTargetHost(attemptsLeft - 1)
+                    }
+                }, 2000)
+            }
+        }
     }
 
     private fun startDedicatedSenderThread() {
@@ -241,14 +293,12 @@ class GamepadProxyService : Service() {
         }
     }
 
-    // --- ОТПРАВКА МУЛЬТИМЕДИА КОМАНД (ГРОМКОСТЬ) ---
     fun sendVolumePulse(up: Boolean) {
         val host = connectedHost ?: return
         val hid = btHidDevice ?: return
 
         volumeExecutor.execute {
             val volBuffer = ByteArray(1)
-            // Бит 0 - Volume UP (1), Бит 1 - Volume DOWN (2)
             volBuffer[0] = if (up) 1.toByte() else 2.toByte()
             hid.sendReport(host, XboxHidDescriptor.VOLUME_REPORT_ID.toInt(), volBuffer)
 
@@ -271,7 +321,8 @@ class GamepadProxyService : Service() {
     }
 
     private fun isTriggerChanged(oldUnsigned: Int, newUnsigned: Int): Boolean {
-        return ((newUnsigned == 0 || newUnsigned == 255) && oldUnsigned != newUnsigned) || abs(oldUnsigned - newUnsigned) >= 3
+        if ((newUnsigned == 0 || newUnsigned == 255) && oldUnsigned != newUnsigned) return true
+        return abs(oldUnsigned - newUnsigned) >= 3
     }
 
     private fun calculateHatSwitch(x: Float, y: Float): Byte {
@@ -284,13 +335,5 @@ class GamepadProxyService : Service() {
         val channel = NotificationChannel(channelId, "BTBOX-mz Service", NotificationManager.IMPORTANCE_LOW)
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         startForeground(1, Notification.Builder(this, channelId).setContentTitle("BTBOX-mz").setContentText("Режим Bluetooth-геймпада активен").setSmallIcon(android.R.drawable.stat_sys_data_bluetooth).build())
-    }
-
-    override fun onDestroy() {
-        senderRunning = false
-        volumeExecutor.shutdownNow()
-        synchronized(stateLock) { stateLock.notifyAll() }
-        btHidDevice?.unregisterApp()
-        super.onDestroy()
     }
 }
